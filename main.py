@@ -539,13 +539,8 @@ class MainWindow(QMainWindow):
             if k == inv_key: # Already handled as top-right INV
                 continue
             
-            text = ""
-            if k.upper() in ["PO", "PO#"]:
-                text = f"{k}: {v}"
-            elif k == "INV": # specific fallback
-                 text = f"INV: {v}"
-            else:
-                 text = str(v)
+            text = str(v)
+            # Removed automatic prefixing logic for PO and INV as per user request
             
             # Determine Priority from Mapping
             # Find the mapping item corresponding to this key (display name)
@@ -676,7 +671,7 @@ class MainWindow(QMainWindow):
             if inv_val:
                 c.setFont(font_inv, size_inv)
                 inv_y = bc_bottom + bc_h + gap
-                c.drawCentredString(cx, inv_y, f"INV: {inv_val}")
+                c.drawCentredString(cx, inv_y, inv_val)
 
         else:
              # Small Label Logic (Similar but tighter)
@@ -686,7 +681,7 @@ class MainWindow(QMainWindow):
              # Draw INV at Top
              if inv_val:
                  c.setFont(font_inv, size_inv)
-                 c.drawCentredString(cx, y + h - size_inv, f"INV: {inv_val}")
+                 c.drawCentredString(cx, y + h - size_inv, inv_val)
              
              # Footer fields at bottom
              c.setFont(font_info, size_info)
