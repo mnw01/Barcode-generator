@@ -203,9 +203,6 @@ class BarcodePreviewThread(QThread):
                     # Explicitly include barcode source in footer if it exists as text?
                     # Generally yes, unless it's strictly barcode-only. 
                     
-                    # Exclude Remarks
-                    if k == getattr(self, "remarks_source", "备注"): continue
-
                     # Auto-append Week Number to P/I
                     if k == "P/I":
                         try:
@@ -443,9 +440,9 @@ class SupabaseDatabase(AbstractDatabase):
 
     def add_batch(self, filename):
         if not self.enabled: return 0
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
-            data = {"filename": filename, "imported_at": now_str}
+            # Omit 'imported_at' to let Supabase use server time (UTC)
+            data = {"filename": filename}
             res = self.client.table("batches").insert(data).execute()
             if res.data:
                 return res.data[0]['id']
@@ -890,7 +887,6 @@ class MainWindow(QMainWindow):
         # Load Source Selections
         self.barcode_source = self.settings.value("barcode_source", "P/I")
         self.qty_source = self.settings.value("qty_source", "Quantity")
-        self.remarks_source = self.settings.value("remarks_source", "备注") # Default "备注"
         self.label_multiplier = int(self.settings.value("label_multiplier", 1))
 
     def setup_settings_page_general(self, parent_widget):
@@ -941,19 +937,12 @@ class MainWindow(QMainWindow):
         
         self.combo_barcode_source = QComboBox()
         self.combo_qty_source = QComboBox()
-        self.combo_remarks_source = QComboBox()
-        
-        # Populate Combos
         self.update_source_combos()
-        
-        # Set current selection
         self.set_combo_text(self.combo_barcode_source, self.barcode_source)
         self.set_combo_text(self.combo_qty_source, self.qty_source)
-        self.set_combo_text(self.combo_remarks_source, self.remarks_source)
 
         form_layout.addRow("条码数据来源 (Barcode Source):", self.combo_barcode_source)
         form_layout.addRow("数量来源 (Quantity Source):", self.combo_qty_source)
-        form_layout.addRow("备注数据来源 (Remarks Source - 不打印):", self.combo_remarks_source)
         
         # Multiplier Setting
         self.spin_multiplier = QSpinBox()
@@ -1085,20 +1074,8 @@ class MainWindow(QMainWindow):
         self.combo_qty_source.clear()
         self.combo_qty_source.addItems(names)
         
-        self.combo_remarks_source.clear()
-        self.combo_remarks_source.addItems(names)
-        
         self.set_combo_text(self.combo_barcode_source, curr_bc)
         self.set_combo_text(self.combo_qty_source, curr_qty)
-        # Restore remarks selection if possible, else default to '备注'
-        curr_remarks = getattr(self, "remarks_source", "备注") 
-        # But wait, we don't have local var for current combo text yet because it might be empty on first load
-        # Let's try to preserve combo text if it exists
-        curr_combo_rem = self.combo_remarks_source.currentText()
-        if curr_combo_rem:
-             self.set_combo_text(self.combo_remarks_source, curr_combo_rem)
-        else:
-             self.set_combo_text(self.combo_remarks_source, curr_remarks)
 
     def set_combo_text(self, combo, text):
         index = combo.findText(text)
@@ -1129,14 +1106,12 @@ class MainWindow(QMainWindow):
         # 2. Get Sources
         self.barcode_source = self.combo_barcode_source.currentText()
         self.qty_source = self.combo_qty_source.currentText()
-        self.remarks_source = self.combo_remarks_source.currentText()
         self.label_multiplier = self.spin_multiplier.value()
         
         # 3. Save to QSettings
-        self.settings.setValue("column_mapping", json.dumps(self.column_mapping, ensure_ascii=False))
+        self.settings.setValue("column_mapping", json.dumps(self.column_mapping))
         self.settings.setValue("barcode_source", self.barcode_source)
         self.settings.setValue("qty_source", self.qty_source)
-        self.settings.setValue("remarks_source", self.remarks_source)
         self.settings.setValue("label_multiplier", self.label_multiplier)
         
         QMessageBox.information(self, "成功", "设置已保存！")
@@ -2084,9 +2059,6 @@ class MainWindow(QMainWindow):
             if k == inv_key: # Already handled as top-right INV
                 continue
             
-            # Exclude Remarks
-            if k == getattr(self, "remarks_source", "备注"): continue
-            
             # Auto-append Week Number to P/I
             if k == "P/I":
                 try:
@@ -2548,9 +2520,6 @@ class MainWindow(QMainWindow):
         for k, v in item_data.items():
             if k == self.qty_source: continue
             if k == inv_key: continue
-            
-            # Exclude Remarks
-            if k == getattr(self, "remarks_source", "备注"): continue
             
             # Auto-append Week Number to P/I
             if k == "P/I":
