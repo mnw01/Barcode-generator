@@ -49,6 +49,7 @@ pyinstaller --noconfirm --onedir --windowed --name "BarcodeGenerator" --add-data
 *   **Excel 列映射**：设置 Excel 列名与系统字段的对应关系（如“产品编号”->“Barcode Source”）。
 *   **条码来源**：选择哪一列的数据用于生成条码。
 *   **打印倍数**：设置默认的打印数量倍数。
+*   **备注数据来源**：设置某一列为备注（仅在软件中显示，不打印在标签上）。
 
 ### 2. 云端同步配置
 如果要启用多端历史记录共享：
