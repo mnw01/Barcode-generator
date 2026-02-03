@@ -4,3 +4,4 @@ openpyxl
 reportlab
 python-barcode
 Pillow
+supabase

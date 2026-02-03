@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QLineEdit, QMessageBox, QFrame, QCheckBox, QSpacerItem, 
                              QSizePolicy, QFileDialog, QTableWidget, QTableWidgetItem,
                              QComboBox, QHeaderView, QGroupBox, QFormLayout, QMenu,
-                             QStyle, QStyleOptionHeader, QDialog, QInputDialog, QSpinBox)
+                             QStyle, QStyleOptionHeader, QDialog, QInputDialog, QSpinBox, QDoubleSpinBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QRect, QPointF, QPoint, QCoreApplication, QTimer
 from PyQt6.QtGui import QIcon, QAction, QPainter, QColor, QPixmap, QImage, QFontMetrics, QPageLayout, QPageSize, QFont
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog, QPrinterInfo
@@ -203,6 +203,14 @@ class BarcodePreviewThread(QThread):
                     # Explicitly include barcode source in footer if it exists as text?
                     # Generally yes, unless it's strictly barcode-only. 
                     
+                    # Auto-append Week Number to P/I
+                    if k == "P/I":
+                        try:
+                            week_num = datetime.now().isocalendar()[1]
+                            v = f"{v}  {week_num}"
+                        except:
+                            pass
+
                     priority = 10
                     for m in self.column_mapping:
                         if m["name"] == k:
@@ -210,7 +218,6 @@ class BarcodePreviewThread(QThread):
                             break
                     footer_fields.append((priority, str(v)))
                 
-                footer_fields.sort(key=lambda x: x[0])
                 footer_fields.sort(key=lambda x: x[0])
                 footer_texts = [f[1] for f in footer_fields]
 
@@ -340,7 +347,17 @@ class BarcodePreviewThread(QThread):
         self.wait()
 
 
-class DatabaseManager:
+# --- Database Abstraction ---
+
+class AbstractDatabase:
+    def add_batch(self, filename): raise NotImplementedError
+    def add_item(self, batch_id, content_data): raise NotImplementedError
+    def update_item_status(self, item_id, status): raise NotImplementedError
+    def get_batches(self): raise NotImplementedError
+    def get_batch_items(self, batch_id): raise NotImplementedError
+    def delete_batch(self, batch_id): raise NotImplementedError
+
+class LocalDatabase(AbstractDatabase):
     def __init__(self, db_name="barcode_history.db"):
         self.conn = sqlite3.connect(db_name)
         self.create_tables()
@@ -374,8 +391,6 @@ class DatabaseManager:
 
     def add_item(self, batch_id, content_data):
         cursor = self.conn.cursor()
-        # Save exact dict as JSON
-        import json
         json_str = json.dumps(content_data, ensure_ascii=False)
         cursor.execute("INSERT INTO batch_items (batch_id, content_json, status) VALUES (?, ?, ?)", 
                        (batch_id, json_str, '⏳'))
@@ -396,9 +411,7 @@ class DatabaseManager:
         cursor = self.conn.cursor()
         cursor.execute("SELECT id, content_json, status FROM batch_items WHERE batch_id = ?", (batch_id,))
         rows = cursor.fetchall()
-        # Convert JSON back to dict
         result = []
-        import json
         for r in rows:
             result.append({
                 "id": r[0],
@@ -409,18 +422,135 @@ class DatabaseManager:
 
     def delete_batch(self, batch_id):
         cursor = self.conn.cursor()
-        # Delete items first
         cursor.execute("DELETE FROM batch_items WHERE batch_id = ?", (batch_id,))
-        # Delete batch
         cursor.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
         self.conn.commit()
+
+class SupabaseDatabase(AbstractDatabase):
+    def __init__(self, url, key):
+        self.enabled = False
+        try:
+            from supabase import create_client, Client
+            self.client: Client = create_client(url, key)
+            self.enabled = True
+        except ImportError:
+            print("Supabase lib not installed. Run: pip install supabase")
+        except Exception as e:
+            print(f"Supabase Connection Error: {e}")
+
+    def add_batch(self, filename):
+        if not self.enabled: return 0
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            data = {"filename": filename, "imported_at": now_str}
+            res = self.client.table("batches").insert(data).execute()
+            if res.data:
+                return res.data[0]['id']
+        except Exception as e:
+            print(f"Supabase Add Batch Error: {e}")
+        return 0
+
+    def add_item(self, batch_id, content_data):
+        if not self.enabled: return 0
+        try:
+            json_str = json.dumps(content_data, ensure_ascii=False)
+            data = {"batch_id": batch_id, "content_json": json_str, "status": '⏳'}
+            res = self.client.table("batch_items").insert(data).execute()
+            if res.data:
+                return res.data[0]['id']
+        except Exception as e:
+            print(f"Supabase Add Item Error: {e}")
+        return 0
+
+    def update_item_status(self, item_id, status):
+        if not self.enabled: return
+        try:
+            self.client.table("batch_items").update({"status": status}).eq("id", item_id).execute()
+        except: pass
+
+    def get_batches(self):
+        if not self.enabled: return []
+        try:
+            res = self.client.table("batches").select("*").order("id", desc=True).execute()
+            # Convert to tuple list to match local interface: (id, filename, imported_at)
+            results = []
+            for r in res.data:
+                # Format Timestamp (ISO -> YYYY-MM-DD HH:MM:SS)
+                ts_str = r['imported_at']
+                try:
+                    # Supabase returns ISO 8601 (e.g., 2026-02-03T11:57:10+00:00)
+                    if "T" in str(ts_str):
+                        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                        # Convert to Local (naive) for display consistency with LocalDB
+                        ts_str = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    pass # Keep original if parse fails
+                
+                results.append((r['id'], r['filename'], ts_str))
+            return results
+        except Exception as e:
+            print(f"Supabase Get Batches Error: {e}")
+            return []
+
+    def get_batch_items(self, batch_id):
+        if not self.enabled: return []
+        try:
+            res = self.client.table("batch_items").select("*").eq("batch_id", batch_id).execute()
+            result = []
+            for r in res.data:
+                result.append({
+                    "id": r['id'],
+                    "data": json.loads(r['content_json']),
+                    "status": r['status']
+                })
+            return result
+        except Exception as e:
+            print(f"Supabase Get Items Error: {e}")
+            return []
+
+    def delete_batch(self, batch_id):
+        if not self.enabled: return
+        try:
+            self.client.table("batch_items").delete().eq("batch_id", batch_id).execute()
+            self.client.table("batches").delete().eq("id", batch_id).execute()
+        except: pass
+
+class DatabaseManagerWrapper:
+    def __init__(self, settings, parent=None):
+        self.settings = settings
+        self.parent = parent
+        self.local_db = LocalDatabase()
+        self.cloud_db = None
+        self.use_cloud = False
+        self.reload_config()
+
+    def reload_config(self):
+        self.use_cloud = self.settings.value("cloud_enabled", "false") == "true"
+        url = self.settings.value("cloud_url", "")
+        key = self.settings.value("cloud_key", "")
+        
+        if self.use_cloud and url and key:
+            self.cloud_db = SupabaseDatabase(url, key)
+            if not self.cloud_db.enabled and self.parent:
+                # Notify only if intended to use but failed impoort
+                 pass 
+        else:
+            self.cloud_db = None
+
+    @property
+    def active_db(self):
+        if self.use_cloud and self.cloud_db and self.cloud_db.enabled:
+            return self.cloud_db
+        return self.local_db
+
+    def __getattr__(self, name):
+        return getattr(self.active_db, name)
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        # Init DB
-        self.db = DatabaseManager()
+        # Init DB - Moved after settings load
 
         self.setWindowTitle("批量条码生成工具")
         self.resize(1000, 700) # Slightly larger for table
@@ -437,7 +567,8 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("MyCompany", "BarcodeGenerator")
         self.load_settings()
 
-        # Main Central Widget
+        # Init DB Wrapper
+        self.db = DatabaseManagerWrapper(self.settings, self)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
@@ -496,6 +627,60 @@ class MainWindow(QMainWindow):
         print_layout.addWidget(lbl_paper)
         print_layout.addWidget(self.combo_paper)
         
+        # Printer Selection
+        lbl_printer = QLabel("选择打印机:")
+        self.combo_printer = QComboBox()
+        self.combo_printer.addItem("系统默认 (System Default)")
+        self.combo_printer.addItems(QPrinterInfo.availablePrinterNames())
+        
+        # Restore saved printer
+        saved_printer = self.settings.value("target_printer_name", "系统默认 (System Default)")
+        idx = self.combo_printer.findText(saved_printer)
+        if idx >= 0: self.combo_printer.setCurrentIndex(idx)
+        self.combo_printer.currentTextChanged.connect(lambda text: self.settings.setValue("target_printer_name", text))
+        
+        print_layout.addWidget(lbl_printer)
+        print_layout.addWidget(self.combo_printer)
+        
+        # Margins (X, Y)
+        lbl_margin = QLabel("偏移调整 (mm):")
+        margin_layout = QHBoxLayout()
+        
+        # Margin X
+        self.spin_margin_x = QDoubleSpinBox()
+        self.spin_margin_x.setRange(-50.0, 50.0)
+        self.spin_margin_x.setSuffix(" mm")
+        self.spin_margin_x.setSingleStep(0.5)
+        self.spin_margin_x.setValue(float(self.settings.value("print_margin_x", 0.0)))
+        self.spin_margin_x.valueChanged.connect(lambda val: self.settings.setValue("print_margin_x", val))
+        self.spin_margin_x.setToolTip("X轴偏移 (+)向右, (-)向左")
+        
+        # Margin Y
+        self.spin_margin_y = QDoubleSpinBox()
+        self.spin_margin_y.setRange(-50.0, 50.0)
+        self.spin_margin_y.setSuffix(" mm")
+        self.spin_margin_y.setSingleStep(0.5)
+        self.spin_margin_y.setValue(float(self.settings.value("print_margin_y", 0.0)))
+        self.spin_margin_y.valueChanged.connect(lambda val: self.settings.setValue("print_margin_y", val))
+        self.spin_margin_y.setToolTip("Y轴偏移 (+)向下, (-)向上")
+
+        margin_layout = QVBoxLayout()
+        
+        # X Row
+        row_x = QHBoxLayout()
+        row_x.addWidget(QLabel("X:"))
+        row_x.addWidget(self.spin_margin_x)
+        margin_layout.addLayout(row_x)
+        
+        # Y Row
+        row_y = QHBoxLayout()
+        row_y.addWidget(QLabel("Y:"))
+        row_y.addWidget(self.spin_margin_y)
+        margin_layout.addLayout(row_y)
+        
+        print_layout.addWidget(lbl_margin)
+        print_layout.addLayout(margin_layout)
+        
         sidebar_layout.addWidget(self.print_group)
 
         # Spacer
@@ -521,7 +706,25 @@ class MainWindow(QMainWindow):
 
         # Page 3: Settings (Placeholder)
         self.page_settings = QWidget()
-        self.setup_settings_page()
+        
+        # Settings Tabs
+        self.settings_tabs = QStackedWidget() # Use internal stack or QTabWidget
+        # Let's use QTabWidget for Settings (Misc, Cloud)
+        from PyQt6.QtWidgets import QTabWidget
+        self.tab_widget = QTabWidget()
+        
+        self.tab_general = QWidget()
+        self.setup_settings_page_general(self.tab_general)
+        self.tab_widget.addTab(self.tab_general, "常规设置 (General)")
+        
+        self.tab_cloud = QWidget()
+        self.setup_settings_page_cloud(self.tab_cloud)
+        self.tab_widget.addTab(self.tab_cloud, "云端同步 (Cloud)")
+        
+        # Original Settings Layout Wrapper
+        settings_layout = QVBoxLayout(self.page_settings)
+        settings_layout.addWidget(self.tab_widget)
+        
         self.content_stack.addWidget(self.page_settings)
         
         # Add Sidebar and Content to Main Layout
@@ -686,32 +889,31 @@ class MainWindow(QMainWindow):
         self.qty_source = self.settings.value("qty_source", "Quantity")
         self.label_multiplier = int(self.settings.value("label_multiplier", 1))
 
-    def setup_settings_page(self):
-        layout = QVBoxLayout(self.page_settings)
+    def setup_settings_page_general(self, parent_widget):
+        layout = QVBoxLayout(parent_widget)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(20)
 
-        
         # --- Column Mapping Table ---
         lbl_mapping = QLabel("Excel 列名映射与字段设置")
         lbl_mapping.setStyleSheet("font-weight: bold; margin-top: 10px;")
         layout.addWidget(lbl_mapping)
-
+        
+        # ... (Table setup remains same logic but attached to 'layout')
         # Table Setup
         self.settings_table = QTableWidget()
         self.settings_table.setColumnCount(3)
         self.settings_table.setHorizontalHeaderLabels(["显示名称 (Display Name)", "Excel 列名 (Excel Header)", "显示顺序 (Sort Order)"])
         self.settings_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.settings_table.verticalHeader().setDefaultSectionSize(45) # Increase row height
-        self.settings_table.setMinimumHeight(400) # Increase visible table height
+        self.settings_table.verticalHeader().setDefaultSectionSize(45) 
+        self.settings_table.setMinimumHeight(400) 
         self.settings_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.settings_table.setAlternatingRowColors(True)
-        # Populate Table
         self.refresh_settings_table()
         
         layout.addWidget(self.settings_table)
-
+        
         # Table Buttons
         btn_layout = QHBoxLayout()
         self.btn_add_col = QPushButton("添加列")
@@ -728,18 +930,14 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.btn_del_col)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
-
+        
         # --- Source Selection ---
         form_layout = QFormLayout()
         form_layout.setContentsMargins(0, 20, 0, 0)
         
         self.combo_barcode_source = QComboBox()
         self.combo_qty_source = QComboBox()
-        
-        # Populate Combos
         self.update_source_combos()
-        
-        # Set current selection
         self.set_combo_text(self.combo_barcode_source, self.barcode_source)
         self.set_combo_text(self.combo_qty_source, self.qty_source)
 
@@ -753,7 +951,7 @@ class MainWindow(QMainWindow):
         form_layout.addRow("打印数量倍数 (Label Multiplier):", self.spin_multiplier)
         
         layout.addLayout(form_layout)
-
+        
         # Save Button
         layout.addSpacing(20)
         btn_save = QPushButton("保存设置")
@@ -764,6 +962,67 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(btn_save)
         layout.addStretch()
+
+    def setup_settings_page_cloud(self, parent_widget):
+        layout = QVBoxLayout(parent_widget)
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(20)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        
+        title = QLabel("云端同步设置 (Supabase Cloud)")
+        title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        layout.addWidget(title)
+        
+        desc = QLabel("启用云端同步后，历史记录将保存到在线数据库，实现多台电脑数据共享。")
+        desc.setStyleSheet("color: #666;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+        
+        form = QFormLayout()
+        
+        self.chk_cloud_enable = QCheckBox("启用云端同步 (Enable Cloud Sync)")
+        self.chk_cloud_enable.setChecked(self.settings.value("cloud_enabled", "false") == "true")
+        
+        self.input_cloud_url = QLineEdit()
+        self.input_cloud_url.setPlaceholderText("https://xyz.supabase.co")
+        self.input_cloud_url.setText(self.settings.value("cloud_url", ""))
+        
+        self.input_cloud_key = QLineEdit()
+        self.input_cloud_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.input_cloud_key.setPlaceholderText("eyJhbg...")
+        self.input_cloud_key.setText(self.settings.value("cloud_key", ""))
+        
+        form.addRow(self.chk_cloud_enable)
+        form.addRow("Project URL:", self.input_cloud_url)
+        form.addRow("Anon Key:", self.input_cloud_key)
+        
+        layout.addLayout(form)
+        
+        btn_save_cloud = QPushButton("保存连接设置")
+        btn_save_cloud.setObjectName("ActionButton")
+        btn_save_cloud.setFixedWidth(150)
+        btn_save_cloud.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_save_cloud.clicked.connect(self.save_cloud_settings)
+        
+        layout.addWidget(btn_save_cloud)
+        layout.addStretch()
+
+    def save_cloud_settings(self):
+        enabled = self.chk_cloud_enable.isChecked()
+        url = self.input_cloud_url.text().strip()
+        key = self.input_cloud_key.text().strip()
+        
+        self.settings.setValue("cloud_enabled", "true" if enabled else "false")
+        self.settings.setValue("cloud_url", url)
+        self.settings.setValue("cloud_key", key)
+        
+        # Trigger reload in DB wrapper
+        self.db.reload_config()
+        
+        if enabled and (not url or not key):
+             QMessageBox.warning(self, "提示", "请填写完整的 URL 和 Key")
+        else:
+             QMessageBox.information(self, "保存成功", "云端设置已保存！\n(如果启用，请尝试刷新历史记录查看连接状态)")
 
     def refresh_settings_table(self):
         self.settings_table.setRowCount(0)
@@ -1091,6 +1350,14 @@ class MainWindow(QMainWindow):
             if k == self.qty_source: continue
             if k == inv_key: continue
             
+            # Auto-append Week Number to P/I
+            if k == "P/I":
+                try:
+                    week_num = datetime.now().isocalendar()[1]
+                    v = f"{v}  {week_num}"
+                except:
+                    pass
+
             priority = 10
             for m in self.column_mapping:
                 if m["name"] == k:
@@ -1364,6 +1631,14 @@ class MainWindow(QMainWindow):
         for k, v in item_data.items():
             if k == self.qty_source: continue
             if k == inv_key: continue
+            
+            # Auto-append Week Number to P/I
+            if k == "P/I":
+                try:
+                    week_num = datetime.now().isocalendar()[1]
+                    v = f"{v}  {week_num}"
+                except:
+                    pass
             
             priority = 10
             for m in self.column_mapping:
@@ -1784,6 +2059,14 @@ class MainWindow(QMainWindow):
             if k == inv_key: # Already handled as top-right INV
                 continue
             
+            # Auto-append Week Number to P/I
+            if k == "P/I":
+                try:
+                    week_num = datetime.now().isocalendar()[1]
+                    v = f"{v}  {week_num}"
+                except:
+                    pass
+            
             text = str(v)
             # Removed automatic prefixing logic for PO and INV as per user request
             
@@ -2185,10 +2468,18 @@ class MainWindow(QMainWindow):
         # 4. Print Dialog
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         
-        # Restore Printer Selection
-        last_printer = self.settings.value("last_printer_name", "")
-        if last_printer:
-            printer.setPrinterName(last_printer)
+        # Apply Logic:
+        # A. Priority 1: User Selected "Target Printer" in Sidebar
+        # B. Priority 2: "System Default" (default behavior)
+        
+        target_printer = self.combo_printer.currentText()
+        if target_printer and target_printer != "系统默认 (System Default)":
+            printer.setPrinterName(target_printer)
+        else:
+            # Fallback to saved last used or default
+            last_printer = self.settings.value("last_printer_name", "")
+            if last_printer:
+                printer.setPrinterName(last_printer)
             
         # Set Doc Name
         raw_barcode = str(item_data.get(self.barcode_source, "Barcode"))
@@ -2230,6 +2521,14 @@ class MainWindow(QMainWindow):
             if k == self.qty_source: continue
             if k == inv_key: continue
             
+            # Auto-append Week Number to P/I
+            if k == "P/I":
+                try:
+                    week_num = datetime.now().isocalendar()[1]
+                    v = f"{v}  {week_num}"
+                except:
+                    pass
+
             priority = 10
             for m in self.column_mapping:
                 if m["name"] == k:
@@ -2289,7 +2588,25 @@ class MainWindow(QMainWindow):
                 w = int(rect.width())
                 h = int(rect.height())
                 
+                # Apply Margins (X, Y)
+                margin_x_mm = self.spin_margin_x.value()
+                margin_y_mm = self.spin_margin_y.value()
+                
+                # Convert mm to pixels based on Printer DPI
+                # DPI = Dots Per Inch
+                # 1 inch = 25.4 mm
+                dpi_x = printer.logicalDpiX()
+                dpi_y = printer.logicalDpiY()
+                
+                off_x = int((margin_x_mm / 25.4) * dpi_x)
+                off_y = int((margin_y_mm / 25.4) * dpi_y)
+                
+                painter.save()
+                painter.translate(off_x, off_y)
+                
                 self.draw_label_on_qpainter(painter, w, h, barcode_content, inv_val, footer_texts, is_100x100)
+                
+                painter.restore()
                 
                 # Yield to ensure UI updates are visible
                 # Also slight throttling prevents UI freeze on weaker machines
