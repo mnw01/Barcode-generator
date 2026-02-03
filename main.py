@@ -441,8 +441,9 @@ class SupabaseDatabase(AbstractDatabase):
     def add_batch(self, filename):
         if not self.enabled: return 0
         try:
-            # Omit 'imported_at' to let Supabase use server time (UTC)
-            data = {"filename": filename}
+            # Use client's local time with timezone info to ensure accuracy
+            now_iso = datetime.now().astimezone().isoformat()
+            data = {"filename": filename, "imported_at": now_iso}
             res = self.client.table("batches").insert(data).execute()
             if res.data:
                 return res.data[0]['id']
@@ -1176,11 +1177,17 @@ class MainWindow(QMainWindow):
             self.history_batch_list.insertRow(row)
             batch_id = b[0]
             # ID
-            self.history_batch_list.setItem(row, 0, QTableWidgetItem(str(batch_id)))
+            item_id = QTableWidgetItem(str(batch_id))
+            item_id.setToolTip(str(batch_id)) # Add tooltip
+            self.history_batch_list.setItem(row, 0, item_id)
             # Time
-            self.history_batch_list.setItem(row, 1, QTableWidgetItem(str(b[2])))
+            item_time = QTableWidgetItem(str(b[2]))
+            item_time.setToolTip(str(b[2])) # Add tooltip
+            self.history_batch_list.setItem(row, 1, item_time)
             # Filename
-            self.history_batch_list.setItem(row, 2, QTableWidgetItem(str(b[1])))
+            item_filename = QTableWidgetItem(str(b[1]))
+            item_filename.setToolTip(str(b[1])) # Add tooltip
+            self.history_batch_list.setItem(row, 2, item_filename)
             
             # Delete Button
             btn_del = QPushButton("×")
@@ -1265,7 +1272,9 @@ class MainWindow(QMainWindow):
             for col_map in self.column_mapping:
                 # Use data from JSON
                 val = data.get(col_map["name"], "")
-                self.history_detail_table.setItem(row_idx, col_idx, QTableWidgetItem(str(val)))
+                item_val = QTableWidgetItem(str(val))
+                item_val.setToolTip(str(val)) # Add Tooltip
+                self.history_detail_table.setItem(row_idx, col_idx, item_val)
                 col_idx += 1
                 
             # Preview Column
@@ -1465,7 +1474,10 @@ class MainWindow(QMainWindow):
                 for col_map in self.column_mapping:
                     excel_header = col_map["header"]
                     val = str(row.get(excel_header, "")) if pd.notna(row.get(excel_header, "")) else ""
-                    self.table.setItem(row_idx, col_idx, QTableWidgetItem(val))
+                    
+                    item_val = QTableWidgetItem(val)
+                    item_val.setToolTip(val) # Add Tooltip
+                    self.table.setItem(row_idx, col_idx, item_val)
                     
                     # Store in snapshot
                     item_snapshot[col_map["name"]] = val
