@@ -367,7 +367,8 @@ class DatabaseManager:
 
     def add_batch(self, filename):
         cursor = self.conn.cursor()
-        cursor.execute("INSERT INTO batches (filename) VALUES (?)", (filename,))
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("INSERT INTO batches (filename, imported_at) VALUES (?, ?)", (filename, now_str))
         self.conn.commit()
         return cursor.lastrowid
 
