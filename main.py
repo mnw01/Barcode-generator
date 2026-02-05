@@ -86,16 +86,6 @@ class FilterHeader(QHeaderView):
         # Skip icon for last three columns (Preview, Status, Action)
         if logicalIndex >= self.model().columnCount() - 3:
             return
-
-        # Draw Filter Icon (Manual Polygon)
-        # ... (Same logic, simple icon)
-        
-        # Check filter status
-        # Since this class is reusable, we need access to 'column_filters'
-        # Pass a callback or access parent? Parent might be QTableWidget. 
-        # The filter logic currently in MainWindow relies on 'self.table'. 
-        # History table probably doesn't need filtering yet, or if it does, duplication is needed.
-        # For now, let's keep drawing the icon.
         
         opt = QStyleOptionHeader()
         self.initStyleOption(opt)
@@ -657,11 +647,7 @@ class DatabaseManagerWrapper:
         else:
             self.cloud_db = None
 
-    # Removed active_db and __getattr__ to enforce explicit local DB usage
-    # def active_db(self): ...
-    # def __getattr__(self, name): ...
-    
-    # --- Local-First Explicit Implementation ---
+    # --- Local-First Database Methods ---
     def add_batch(self, filename):
         return self.local_db.add_batch(filename)
 
@@ -697,31 +683,6 @@ class DatabaseManagerWrapper:
         if batch_info and self.use_cloud and self.cloud_db and self.cloud_db.enabled:
             self.cloud_db.delete_batch_by_key(batch_info[0], batch_info[1])
 
-    def sync_all_data(self):
-        """Uploads all local history to cloud if not exists"""
-        if not self.use_cloud or not self.cloud_db or not self.cloud_db.enabled:
-            return 0
-        
-        batches = self.local_db.get_batches()
-        count = 0
-        for b in batches:
-            # b: (id, filename, imported_at)
-            # Check exist ?
-            # Since check_batch_exists is rough, let's just attempt or trust simplistic check
-            # For now, just simplistic:
-            # We skip 'check_batch_exists' call for now to avoid complexity or just re-upload? 
-            # Re-uploading creates duplicates. We need to check.
-            # Let's rely on 'filename' being reasonably unique per import time?
-            # Or just check if filename matches.
-            
-            # Using the method we added:
-            # Note: imported_at in Local is "YYYY-MM-DD..."
-            # Supabase stores ISO. exact match fails.
-            # So `check_batch_exists` inside `SupabaseDatabase` needs to be smart or we skip check and rely on user?
-            # Let's simple check: Check if filename exists in last 100 batches?
-            pass # Implemented in actual logic below
-            
-        return count
 
     def perform_sync(self, progress_callback=None):
         if not self.use_cloud or not self.cloud_db or not self.cloud_db.enabled:
@@ -818,6 +779,11 @@ class MainWindow(FluentWindow):
         # Init DB - Moved after settings load
 
         self.setWindowTitle("批量条码生成工具")
+        
+        # Set Window Icon
+        if os.path.exists("app.ico"):
+            self.setWindowIcon(QIcon("app.ico"))
+            
         self.resize(1100, 750) 
         
         # Enable Fluent Theme
@@ -1786,6 +1752,17 @@ class MainWindow(FluentWindow):
         if not file_path:
             return
 
+        # Show loading dialog
+        from PyQt6.QtWidgets import QProgressDialog
+        loading = QProgressDialog("正在导入文件...", None, 0, 0, self)
+        loading.setWindowTitle("请稍候")
+        loading.setWindowModality(Qt.WindowModality.WindowModal)
+        loading.setMinimumDuration(0)
+        loading.setCancelButton(None)
+        loading.setMinimumWidth(280)
+        loading.show()
+        QApplication.processEvents()
+
         try:
             self.df = pd.read_excel(file_path)
             
@@ -1938,6 +1915,8 @@ class MainWindow(FluentWindow):
 
         except Exception as e:
             QMessageBox.critical(self, "导入失败", f"无法读取文件: {str(e)}")
+        finally:
+            loading.close()
 
     def start_preview_thread(self, tasks):
         paper_type = self.combo_paper.currentText()
