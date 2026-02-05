@@ -1,5 +1,9 @@
 import sys
 import os
+
+# Force qfluentwidgets to use PyQt6 (resolves conflict with installed PyQt5)
+os.environ["QT_API"] = "pyqt6"
+
 import io
 import re
 import sqlite3
@@ -8,11 +12,30 @@ import json
 from datetime import datetime
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QPushButton, QLabel, QStackedWidget, 
-                             QLineEdit, QMessageBox, QFrame, QCheckBox, QSpacerItem, 
+                             QHBoxLayout, QLabel, QStackedWidget, 
+                             QMessageBox, QFrame, QCheckBox, QSpacerItem, 
                              QSizePolicy, QFileDialog, QTableWidget, QTableWidgetItem,
                              QComboBox, QHeaderView, QGroupBox, QFormLayout, QMenu,
                              QStyle, QStyleOptionHeader, QDialog, QInputDialog, QSpinBox, QDoubleSpinBox)
+
+# NOTE: Initialize QApplication BEFORE importing qfluentwidgets to avoid "Must construct a QApplication" error
+# caused by potential widget instantiation at module level in some versions/configurations.
+if QApplication.instance() is None:
+    app = QApplication(sys.argv)
+else:
+    app = QApplication.instance()
+
+# Suppress qfluentwidgets promotional message
+_original_stdout = sys.stdout
+sys.stdout = io.StringIO()
+try:
+    from qfluentwidgets import (FluentWindow, NavigationInterface, NavigationItemPosition, 
+                                PrimaryPushButton, PushButton, LineEdit, FluentIcon, 
+                                Theme, setTheme, SubtitleLabel, BodyLabel, InfoBar,
+                                TableWidget, ComboBox, SpinBox, DoubleSpinBox,
+                                Pivot, SegmentedWidget, ScrollArea, SimpleCardWidget, CheckBox)
+finally:
+    sys.stdout = _original_stdout
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QRect, QPointF, QPoint, QCoreApplication, QTimer
 from PyQt6.QtGui import QIcon, QAction, QPainter, QColor, QPixmap, QImage, QFontMetrics, QPageLayout, QPageSize, QFont
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog, QPrinterInfo
@@ -438,6 +461,61 @@ class SupabaseDatabase(AbstractDatabase):
         except Exception as e:
             print(f"Supabase Connection Error: {e}")
 
+    def check_batch_exists(self, filename, imported_at):
+        if not self.enabled: return False
+        try:
+            # Simple check by filename and time (rough check)
+            # Timestamps might differ slightly due to timezone parsing, so we might just check filename + approximate time or just filename if distinct enough.
+            # Let's check matching filename and imported_at string loosely? 
+            # Actually, let's just check if ANY batch with same filename exists for now, or match exact string if valid.
+            res = self.client.table("batches").select("id").eq("filename", filename).eq("imported_at", imported_at).execute()
+            return len(res.data) > 0
+        except:
+            return False
+
+    def upload_local_batch(self, batch_row, items):
+        if not self.enabled: return False
+        try:
+            # batch_row: (id, filename, imported_at)
+            filename = batch_row[1]
+            imported_at = batch_row[2] # String from local DB
+            
+            # Check existence
+            # For robustness, we try to convert local time string to ISO 8601 with offset if possible, 
+            # but Supabase expects ISO. Local DB stores "YYYY-MM-DD HH:MM:SS" (naive).
+            # We'll treat local as system local time.
+            try:
+                dt = datetime.strptime(imported_at, "%Y-%m-%d %H:%M:%S")
+                # Assume local system time
+                iso_time = dt.astimezone().isoformat()
+            except:
+                iso_time = datetime.now().astimezone().isoformat()
+            
+            # Insert Batch
+            data = {"filename": filename, "imported_at": iso_time}
+            res = self.client.table("batches").insert(data).execute()
+            if not res.data: return False
+            new_batch_id = res.data[0]['id']
+            
+            # Insert Items
+            items_data = []
+            for item in items:
+                # item: {id, data, status}
+                json_str = json.dumps(item['data'], ensure_ascii=False)
+                items_data.append({
+                    "batch_id": new_batch_id,
+                    "content_json": json_str,
+                    "status": item['status']
+                })
+            
+            if items_data:
+                self.client.table("batch_items").insert(items_data).execute()
+            
+            return True
+        except Exception as e:
+            print(f"Upload Error: {e}")
+            return False
+
     def add_batch(self, filename):
         if not self.enabled: return 0
         try:
@@ -516,6 +594,47 @@ class SupabaseDatabase(AbstractDatabase):
             self.client.table("batches").delete().eq("id", batch_id).execute()
         except: pass
 
+    def delete_batch_by_key(self, filename, imported_at):
+        """Delete batch from cloud by matching filename and imported_at timestamp"""
+        if not self.enabled: return False
+        try:
+            # Convert local timestamp format to match cloud format for searching
+            # Local format: "YYYY-MM-DD HH:MM:SS"
+            # We need to find the matching batch in cloud
+            
+            # Get all batches and find matching one
+            res = self.client.table("batches").select("id, filename, imported_at").execute()
+            
+            for batch in res.data:
+                cloud_filename = batch['filename']
+                cloud_ts = batch['imported_at']
+                
+                # Convert cloud timestamp to local format for comparison
+                try:
+                    if "T" in str(cloud_ts):
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(cloud_ts.replace('Z', '+00:00'))
+                        cloud_ts_local = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        cloud_ts_local = cloud_ts
+                except:
+                    cloud_ts_local = cloud_ts
+                
+                # Match by filename and timestamp
+                if cloud_filename == filename and cloud_ts_local == imported_at:
+                    cloud_batch_id = batch['id']
+                    # Delete items first, then batch
+                    self.client.table("batch_items").delete().eq("batch_id", cloud_batch_id).execute()
+                    self.client.table("batches").delete().eq("id", cloud_batch_id).execute()
+                    print(f"[Cloud Delete] Deleted batch: {filename} @ {imported_at}")
+                    return True
+            
+            print(f"[Cloud Delete] No matching batch found: {filename} @ {imported_at}")
+            return False
+        except Exception as e:
+            print(f"[Cloud Delete] Error: {e}")
+            return False
+
 class DatabaseManagerWrapper:
     def __init__(self, settings, parent=None):
         self.settings = settings
@@ -538,29 +657,176 @@ class DatabaseManagerWrapper:
         else:
             self.cloud_db = None
 
-    @property
-    def active_db(self):
+    # Removed active_db and __getattr__ to enforce explicit local DB usage
+    # def active_db(self): ...
+    # def __getattr__(self, name): ...
+    
+    # --- Local-First Explicit Implementation ---
+    def add_batch(self, filename):
+        return self.local_db.add_batch(filename)
+
+    def add_item(self, batch_id, content_data):
+        return self.local_db.add_item(batch_id, content_data)
+
+    def update_item_status(self, item_id, status):
+        return self.local_db.update_item_status(item_id, status)
+
+    def get_batches(self):
+        return self.local_db.get_batches()
+
+    def get_batch_items(self, batch_id):
+        return self.local_db.get_batch_items(batch_id)
+
+    def delete_batch(self, batch_id):
+        # Get batch info before deleting (for cloud sync)
+        batch_info = None
         if self.use_cloud and self.cloud_db and self.cloud_db.enabled:
-            return self.cloud_db
-        return self.local_db
+            try:
+                cursor = self.local_db.conn.cursor()
+                cursor.execute("SELECT filename, imported_at FROM batches WHERE id = ?", (batch_id,))
+                row = cursor.fetchone()
+                if row:
+                    batch_info = (row[0], row[1])  # (filename, imported_at)
+            except:
+                pass
+        
+        # Delete from local database
+        self.local_db.delete_batch(batch_id)
+        
+        # Delete from cloud if enabled and batch info was found
+        if batch_info and self.use_cloud and self.cloud_db and self.cloud_db.enabled:
+            self.cloud_db.delete_batch_by_key(batch_info[0], batch_info[1])
 
-    def __getattr__(self, name):
-        return getattr(self.active_db, name)
+    def sync_all_data(self):
+        """Uploads all local history to cloud if not exists"""
+        if not self.use_cloud or not self.cloud_db or not self.cloud_db.enabled:
+            return 0
+        
+        batches = self.local_db.get_batches()
+        count = 0
+        for b in batches:
+            # b: (id, filename, imported_at)
+            # Check exist ?
+            # Since check_batch_exists is rough, let's just attempt or trust simplistic check
+            # For now, just simplistic:
+            # We skip 'check_batch_exists' call for now to avoid complexity or just re-upload? 
+            # Re-uploading creates duplicates. We need to check.
+            # Let's rely on 'filename' being reasonably unique per import time?
+            # Or just check if filename matches.
+            
+            # Using the method we added:
+            # Note: imported_at in Local is "YYYY-MM-DD..."
+            # Supabase stores ISO. exact match fails.
+            # So `check_batch_exists` inside `SupabaseDatabase` needs to be smart or we skip check and rely on user?
+            # Let's simple check: Check if filename exists in last 100 batches?
+            pass # Implemented in actual logic below
+            
+        return count
 
-class MainWindow(QMainWindow):
+    def perform_sync(self, progress_callback=None):
+        if not self.use_cloud or not self.cloud_db or not self.cloud_db.enabled:
+            return "云端未启用"
+        
+        uploaded = 0
+        downloaded = 0
+        
+        if progress_callback:
+            progress_callback("正在获取本地记录...")
+        
+        # --- Phase 1: Upload Local → Cloud ---
+        local_batches = self.local_db.get_batches()
+        
+        # Get all cloud batches for comparison
+        if progress_callback:
+            progress_callback("正在连接云端...")
+            
+        try:
+            cloud_batches = self.cloud_db.get_batches()
+            cloud_keys = {(cb[1], cb[2]) for cb in cloud_batches}  # (filename, imported_at)
+        except:
+            cloud_keys = set()
+        
+        # Calculate batches to upload
+        batches_to_upload = [b for b in local_batches if (b[1], b[2]) not in cloud_keys]
+        total_upload = len(batches_to_upload)
+        
+        for i, b in enumerate(batches_to_upload):
+            # b: (id, filename, imported_at)
+            if progress_callback:
+                progress_callback(f"上传中 ({i+1}/{total_upload}): {b[1]}")
+            print(f"[Sync Debug] Uploading: {b[1]} @ {b[2]}")
+            items = self.local_db.get_batch_items(b[0])
+            if self.cloud_db.upload_local_batch(b, items):
+                uploaded += 1
+        
+        # --- Phase 2: Download Cloud → Local ---
+        if progress_callback:
+            progress_callback("正在检查云端记录...")
+            
+        try:
+            cloud_batches = self.cloud_db.get_batches()
+            # Use (filename, imported_at) as unique key instead of just filename
+            local_keys = {(b[1], b[2]) for b in local_batches}  # Set of (filename, imported_at)
+            
+            print(f"[Sync Debug] Cloud batches: {len(cloud_batches)}, Local keys: {len(local_keys)}")
+            
+            # Calculate batches to download
+            batches_to_download = [cb for cb in cloud_batches if (cb[1], cb[2]) not in local_keys]
+            total_download = len(batches_to_download)
+            
+            for i, cb in enumerate(batches_to_download):
+                # cb: (id, filename, imported_at)
+                if progress_callback:
+                    progress_callback(f"下载中 ({i+1}/{total_download}): {cb[1]}")
+                    
+                print(f"[Sync Debug] Downloading batch: {cb[1]} @ {cb[2]}")
+                # Download this batch to local
+                cloud_items = self.cloud_db.get_batch_items(cb[0])
+                print(f"[Sync Debug] Cloud items count: {len(cloud_items) if cloud_items else 0}")
+                
+                # Create local batch with the same timestamp
+                cursor = self.local_db.conn.cursor()
+                cursor.execute("INSERT INTO batches (filename, imported_at) VALUES (?, ?)", (cb[1], cb[2]))
+                self.local_db.conn.commit()
+                new_local_batch_id = cursor.lastrowid
+                
+                if cloud_items:
+                    for item in cloud_items:
+                        self.local_db.add_item(new_local_batch_id, item['data'])
+                        # Update status if not default
+                        if item['status'] != '⏳':
+                            cursor = self.local_db.conn.cursor()
+                            cursor.execute("SELECT MAX(id) FROM batch_items WHERE batch_id = ?", (new_local_batch_id,))
+                            last_id = cursor.fetchone()[0]
+                            if last_id:
+                                self.local_db.update_item_status(last_id, item['status'])
+                downloaded += 1
+                
+        except Exception as e:
+            print(f"Download sync error: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        if uploaded == 0 and downloaded == 0:
+            return "数据已同步，无需更新"
+        return f"同步完成: 上传 {uploaded} 条, 下载 {downloaded} 条"
+
+class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
         
         # Init DB - Moved after settings load
 
         self.setWindowTitle("批量条码生成工具")
-        self.resize(1000, 700) # Slightly larger for table
+        self.resize(1100, 750) 
+        
+        # Enable Fluent Theme
+        setTheme(Theme.DARK) # Default to dark as per request for "modern/premium" feel, or AUTO. Let's start with DARK.
 
-        # Data Storage
         # Data Storage
         self.df = None
         self.preview_thread = None
-        self.column_mapping = [] # Initialize empty
+        self.column_mapping = [] 
         self.barcode_source = ""
         self.qty_source = ""
         
@@ -570,42 +836,117 @@ class MainWindow(QMainWindow):
 
         # Init DB Wrapper
         self.db = DatabaseManagerWrapper(self.settings, self)
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
         
-        # Main Layout (Horizontal)
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
-
-        # --- Left Sidebar ---
-        self.sidebar = QFrame()
-        self.sidebar.setObjectName("Sidebar")
-        sidebar_layout = QVBoxLayout(self.sidebar)
-        sidebar_layout.setContentsMargins(10, 20, 10, 20)
-        sidebar_layout.setSpacing(15)
-
-        # Navigation Buttons
-        self.btn_home = QPushButton("首页")
-        self.btn_history = QPushButton("历史记录")
-        self.btn_settings = QPushButton("设置")
+        # --- Initialize Interfaces ---
         
-        for btn in [self.btn_home, self.btn_history, self.btn_settings]:
-            btn.setCheckable(True)
-            btn.setAutoExclusive(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            sidebar_layout.addWidget(btn)
-
-        # --- Sidebar: Print Settings Area ---
-        # Adding a separator or spacing
-        sidebar_layout.addSpacing(20)
+        # 1. Home Interface
+        self.page_home = QWidget()
+        self.page_home.setObjectName("page_home")
+        self.column_filters = {} 
+        self.setup_home_page()
         
-        self.print_group = QGroupBox("打印设置")
-        self.print_group.setObjectName("PrintSettingsGroup")
+        # 2. History Interface
+        self.page_history = QWidget()
+        self.page_history.setObjectName("page_history")
+        self.setup_history_page()
+        
+        # 3. Print Settings Interface
+        self.page_print = QWidget()
+        self.page_print.setObjectName("page_print")
+        self.setup_print_page() # New method to setup print widgets
+        
+        # 4. Settings Interface
+        self.page_settings = QWidget()
+        self.page_settings.setObjectName("page_settings")
+        
+        # 4.1 Header (Segmented Widget as Tabs)
+        settings_main_layout = QVBoxLayout(self.page_settings)
+        settings_main_layout.setContentsMargins(30, 30, 30, 30)
+        settings_main_layout.setSpacing(20)
+        
+        # Title of Settings Page
+        settings_main_layout.addWidget(SubtitleLabel("系统设置 (Settings)", self.page_settings))
+        
+        # Pivot (Tab Bar)
+        self.pivot = SegmentedWidget(self.page_settings)
+        settings_main_layout.addWidget(self.pivot)
+        
+        # Stacked Widget
+        self.settings_stack = QStackedWidget(self.page_settings)
+        settings_main_layout.addWidget(self.settings_stack)
+        
+        # --- Tab 1: General (Wrapped in Header Card for boundary) ---
+        # ScrollArea wrapper
+        self.scroll_general = ScrollArea(self.settings_stack)
+        self.scroll_general.setWidgetResizable(True)
+        self.scroll_general.setStyleSheet("background-color: transparent; border: none;")
+        
+        # Content Card
+        self.card_general = SimpleCardWidget(self.scroll_general)
+        self.card_general.setStyleSheet("SimpleCardWidget { background-color: transparent; }") # Let theme handle, or transparent inside scroll?
+        # Actually SimpleCardWidget has a background.
+        
+        # We need a defined layout for the card
+        # setup_settings_page_general attaches a layout to 'parent_widget'
+        self.setup_settings_page_general(self.card_general)
+        
+        self.scroll_general.setWidget(self.card_general)
+        self.settings_stack.addWidget(self.scroll_general)
+        self.pivot.addItem("general", "常规设置 (General)", lambda: self.settings_stack.setCurrentWidget(self.scroll_general))
+        
+        # --- Tab 2: Cloud ---
+        self.scroll_cloud = ScrollArea(self.settings_stack)
+        self.scroll_cloud.setWidgetResizable(True)
+        self.scroll_cloud.setStyleSheet("background-color: transparent; border: none;")
+        
+        self.card_cloud = SimpleCardWidget(self.scroll_cloud)
+        self.setup_settings_page_cloud(self.card_cloud)
+        
+        self.scroll_cloud.setWidget(self.card_cloud)
+        self.settings_stack.addWidget(self.scroll_cloud)
+        self.pivot.addItem("cloud", "云端同步 (Cloud)", lambda: self.settings_stack.setCurrentWidget(self.scroll_cloud))
+        
+        # Connect pivot
+        self.pivot.setCurrentItem("general")
+        self.settings_stack.setCurrentWidget(self.scroll_general)
+        
+        # --- Add Sub Interfaces to Navigation ---
+        self.addSubInterface(self.page_home, FluentIcon.HOME, "首页")
+        self.addSubInterface(self.page_history, FluentIcon.HISTORY, "历史记录")
+        self.addSubInterface(self.page_print, FluentIcon.PRINT, "打印设置")
+        self.addSubInterface(self.page_settings, FluentIcon.SETTING, "设置", position=NavigationItemPosition.BOTTOM)
+        
+        # Default Page
+        # Default to Home
+        self.switchTo(self.page_home)
+        
+        # Connect Page Switch Signal for Auto-Refresh
+        self.stackedWidget.currentChanged.connect(self.on_page_changed)
+
+    def on_page_changed(self, index):
+        current_widget = self.stackedWidget.widget(index)
+        if current_widget == self.page_history:
+            self.refresh_history_batches()
+
+    def setup_print_page(self):
+        layout = QVBoxLayout(self.page_print)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(20)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        
+        title = SubtitleLabel("打印配置", self.page_print)
+        layout.addWidget(title)
+        
+        # Group Box
+        self.print_group = QGroupBox("打印参数")
+        self.print_group.setStyleSheet("QGroupBox { color: white; font-weight: bold; border: 1px solid #444; border-radius: 8px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: white; }")
         print_layout = QVBoxLayout(self.print_group)
+        print_layout.setContentsMargins(20, 20, 20, 20)
+        print_layout.setSpacing(15)
         
-        lbl_paper = QLabel("选择纸张:")
-        self.combo_paper = QComboBox()
+        # Paper
+        lbl_paper = BodyLabel("选择纸张:")
+        self.combo_paper = ComboBox()
         self.combo_paper.addItems(["A4 (21个/页 3x7矩阵)", "热敏纸 (70x40mm)", "热敏纸 (100x100mm)"])
 
         # Restore saved paper setting
@@ -614,27 +955,21 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.combo_paper.setCurrentIndex(idx)
         else:
-            self.combo_paper.setCurrentIndex(2) # Default fallback
+            self.combo_paper.setCurrentIndex(2) 
             
         self.combo_paper.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.combo_paper.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.combo_paper.setCursor(Qt.CursorShape.PointingHandCursor)
         self.combo_paper.currentTextChanged.connect(lambda text: self.settings.setValue("last_paper_type", text))
-        # Regenerate previews on change
-        self.combo_paper.currentIndexChanged.connect(self.regenerate_previews)
-        # Regenerate previews on change
         self.combo_paper.currentIndexChanged.connect(self.regenerate_previews)
         
         print_layout.addWidget(lbl_paper)
         print_layout.addWidget(self.combo_paper)
         
         # Printer Selection
-        lbl_printer = QLabel("选择打印机:")
-        self.combo_printer = QComboBox()
+        lbl_printer = BodyLabel("选择打印机:")
+        self.combo_printer = ComboBox()
         self.combo_printer.addItem("系统默认 (System Default)")
         self.combo_printer.addItems(QPrinterInfo.availablePrinterNames())
         
-        # Restore saved printer
         saved_printer = self.settings.value("target_printer_name", "系统默认 (System Default)")
         idx = self.combo_printer.findText(saved_printer)
         if idx >= 0: self.combo_printer.setCurrentIndex(idx)
@@ -644,11 +979,11 @@ class MainWindow(QMainWindow):
         print_layout.addWidget(self.combo_printer)
         
         # Margins (X, Y)
-        lbl_margin = QLabel("偏移调整 (mm):")
+        lbl_margin = BodyLabel("偏移调整 (mm):")
         margin_layout = QHBoxLayout()
         
         # Margin X
-        self.spin_margin_x = QDoubleSpinBox()
+        self.spin_margin_x = DoubleSpinBox()
         self.spin_margin_x.setRange(-50.0, 50.0)
         self.spin_margin_x.setSuffix(" mm")
         self.spin_margin_x.setSingleStep(0.5)
@@ -657,91 +992,31 @@ class MainWindow(QMainWindow):
         self.spin_margin_x.setToolTip("X轴偏移 (+)向右, (-)向左")
         
         # Margin Y
-        self.spin_margin_y = QDoubleSpinBox()
+        self.spin_margin_y = DoubleSpinBox()
         self.spin_margin_y.setRange(-50.0, 50.0)
         self.spin_margin_y.setSuffix(" mm")
         self.spin_margin_y.setSingleStep(0.5)
         self.spin_margin_y.setValue(float(self.settings.value("print_margin_y", 0.0)))
         self.spin_margin_y.valueChanged.connect(lambda val: self.settings.setValue("print_margin_y", val))
         self.spin_margin_y.setToolTip("Y轴偏移 (+)向下, (-)向上")
-
-        margin_layout = QVBoxLayout()
         
         # X Row
         row_x = QHBoxLayout()
-        row_x.addWidget(QLabel("X:"))
+        row_x.addWidget(BodyLabel("X:"))
         row_x.addWidget(self.spin_margin_x)
         margin_layout.addLayout(row_x)
         
         # Y Row
         row_y = QHBoxLayout()
-        row_y.addWidget(QLabel("Y:"))
+        row_y.addWidget(BodyLabel("Y:"))
         row_y.addWidget(self.spin_margin_y)
         margin_layout.addLayout(row_y)
         
         print_layout.addWidget(lbl_margin)
         print_layout.addLayout(margin_layout)
         
-        sidebar_layout.addWidget(self.print_group)
-
-        # Spacer
-        sidebar_layout.addItem(QSpacerItem(20, 40, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
-
-        # --- Right Content Area ---
-        self.content_stack = QStackedWidget()
-        self.content_stack.setObjectName("ContentArea")
-
-        # Page 1: Home
-        self.page_home = QWidget()
-        self.column_filters = {} # {col_index: set(allowed_values)}
-        
-        self.setup_home_page()
-        self.content_stack.addWidget(self.page_home)
-
-
-        
-        # Page 2: History
-        self.page_history = QWidget()
-        self.setup_history_page()
-        self.content_stack.addWidget(self.page_history)
-
-        # Page 3: Settings (Placeholder)
-        self.page_settings = QWidget()
-        
-        # Settings Tabs
-        self.settings_tabs = QStackedWidget() # Use internal stack or QTabWidget
-        # Let's use QTabWidget for Settings (Misc, Cloud)
-        from PyQt6.QtWidgets import QTabWidget
-        self.tab_widget = QTabWidget()
-        
-        self.tab_general = QWidget()
-        self.setup_settings_page_general(self.tab_general)
-        self.tab_widget.addTab(self.tab_general, "常规设置 (General)")
-        
-        self.tab_cloud = QWidget()
-        self.setup_settings_page_cloud(self.tab_cloud)
-        self.tab_widget.addTab(self.tab_cloud, "云端同步 (Cloud)")
-        
-        # Original Settings Layout Wrapper
-        settings_layout = QVBoxLayout(self.page_settings)
-        settings_layout.addWidget(self.tab_widget)
-        
-        self.content_stack.addWidget(self.page_settings)
-        
-        # Add Sidebar and Content to Main Layout
-        main_layout.addWidget(self.sidebar)
-        main_layout.addWidget(self.content_stack)
-        
-        # Connect Navigation
-        self.btn_home.clicked.connect(lambda: self.content_stack.setCurrentWidget(self.page_home))
-        self.btn_history.clicked.connect(lambda: (self.refresh_history_batches(), self.content_stack.setCurrentWidget(self.page_history)))
-        self.btn_settings.clicked.connect(lambda: self.content_stack.setCurrentWidget(self.page_settings))
-
-        # Default Page
-        self.btn_home.click()
-
-        # Apply Styles
-        self.apply_styles()
+        layout.addWidget(self.print_group)
+        layout.addStretch()
 
     def setup_home_page(self):
         layout = QVBoxLayout(self.page_home)
@@ -751,42 +1026,29 @@ class MainWindow(QMainWindow):
         # Top Bar: Title and Actions
         top_bar = QHBoxLayout()
         
-        title = QLabel("批量 SKU 条码生成")
-        title.setObjectName("PageTitle")
+        title = SubtitleLabel("批量 SKU 条码生成", self.page_home)
         
-        self.btn_import = QPushButton("导入 Excel")
-        self.btn_import.setObjectName("ActionButton")
+        self.btn_import = PrimaryPushButton("导入 Excel", self.page_home)
         self.btn_import.setFixedWidth(120)
-        self.btn_import.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_import.setIcon(FluentIcon.FOLDER)
         self.btn_import.clicked.connect(self.import_excel)
 
-        self.btn_clear = QPushButton("清空数据")
-        self.btn_clear.setIcon(QIcon(":/icons/clear.png")) # Fallback if no icon, text is enough
-        self.btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_clear.setStyleSheet("""
-            QPushButton {
-                background-color: #d9534f; 
-                color: white; 
-                border-radius: 6px; 
-                padding: 6px 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #c9302c; }
-        """)
+        self.btn_clear = PushButton("清空数据", self.page_home)
+        self.btn_clear.setIcon(FluentIcon.DELETE)
+        # Style handles visually
         self.btn_clear.clicked.connect(self.clear_data_action)
         
         # Search Box
-        self.btn_generate = QPushButton("生成 PDF")
-        self.btn_generate.setObjectName("SuccessButton")
+        self.btn_generate = PrimaryPushButton("生成 PDF", self.page_home)
         self.btn_generate.setFixedWidth(120)
-        self.btn_generate.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_generate.setIcon(FluentIcon.PRINT)
         self.btn_generate.clicked.connect(self.generate_pdf)
         
         top_bar.addWidget(title)
         top_bar.addStretch()
         
         # Search Box
-        self.search_input = QLineEdit()
+        self.search_input = LineEdit(self.page_home)
         self.search_input.setPlaceholderText("搜索 (Search)...")
         self.search_input.setFixedWidth(200)
         self.search_input.setClearButtonEnabled(True)
@@ -800,7 +1062,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(top_bar)
 
         # Table for Data Display
-        self.table = QTableWidget()
+        self.table = TableWidget()
         headers = [item["name"] for item in self.column_mapping] + ["Preview", "Status", "Action"]
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
@@ -830,20 +1092,21 @@ class MainWindow(QMainWindow):
 
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setBorderVisible(True)
+        self.table.setBorderRadius(8)
         
         layout.addWidget(self.table)
 
         # Status Area (Bottom)
         status_layout = QHBoxLayout()
         
-        self.lbl_status = QLabel("就绪")
-        self.lbl_status.setStyleSheet("color: #888;")
+        self.lbl_status = BodyLabel("就绪")
+        self.lbl_status.setStyleSheet("color: #888; font-family: 'Microsoft YaHei'; font-size: 14px;") # Match printer status style
         status_layout.addWidget(self.lbl_status)
         
         status_layout.addStretch()
         
-        self.lbl_printer_status = QLabel("🖨️ 打印机：检测中...")
-        self.lbl_printer_status.setStyleSheet("color: #888;")
+        self.lbl_printer_status = BodyLabel("🖨️ 打印机：检测中...")
         status_layout.addWidget(self.lbl_printer_status)
         
         layout.addLayout(status_layout)
@@ -897,13 +1160,13 @@ class MainWindow(QMainWindow):
         layout.setSpacing(20)
 
         # --- Column Mapping Table ---
-        lbl_mapping = QLabel("Excel 列名映射与字段设置")
-        lbl_mapping.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        lbl_mapping = BodyLabel("Excel 列名映射与字段设置")
+        lbl_mapping.setStyleSheet("font-weight: bold; margin-top: 10px; color: white;")
         layout.addWidget(lbl_mapping)
         
         # ... (Table setup remains same logic but attached to 'layout')
         # Table Setup
-        self.settings_table = QTableWidget()
+        self.settings_table = TableWidget()
         self.settings_table.setColumnCount(3)
         self.settings_table.setHorizontalHeaderLabels(["显示名称 (Display Name)", "Excel 列名 (Excel Header)", "显示顺序 (Sort Order)"])
         self.settings_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -911,20 +1174,22 @@ class MainWindow(QMainWindow):
         self.settings_table.setMinimumHeight(400) 
         self.settings_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.settings_table.setAlternatingRowColors(True)
+        self.settings_table.setBorderVisible(True)
+        self.settings_table.setBorderRadius(8)
         self.refresh_settings_table()
         
         layout.addWidget(self.settings_table)
         
         # Table Buttons
         btn_layout = QHBoxLayout()
-        self.btn_add_col = QPushButton("添加列")
+        self.btn_add_col = PrimaryPushButton("添加列", self.card_general)
+        self.btn_add_col.setIcon(FluentIcon.ADD)
         self.btn_add_col.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_add_col.setStyleSheet("background-color: #4CAF50; color: white; border-radius: 4px; padding: 6px 12px; font-weight: bold;")
         self.btn_add_col.clicked.connect(self.add_column_row)
         
-        self.btn_del_col = QPushButton("删除选中列")
+        self.btn_del_col = PushButton("删除选中列", self.card_general)
+        self.btn_del_col.setIcon(FluentIcon.REMOVE)
         self.btn_del_col.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_del_col.setStyleSheet("background-color: #f44336; color: white; border-radius: 4px; padding: 6px 12px; font-weight: bold;")
         self.btn_del_col.clicked.connect(self.delete_column_row)
         
         btn_layout.addWidget(self.btn_add_col)
@@ -936,28 +1201,28 @@ class MainWindow(QMainWindow):
         form_layout = QFormLayout()
         form_layout.setContentsMargins(0, 20, 0, 0)
         
-        self.combo_barcode_source = QComboBox()
-        self.combo_qty_source = QComboBox()
+        self.combo_barcode_source = ComboBox()
+        self.combo_qty_source = ComboBox()
         self.update_source_combos()
         self.set_combo_text(self.combo_barcode_source, self.barcode_source)
         self.set_combo_text(self.combo_qty_source, self.qty_source)
 
-        form_layout.addRow("条码数据来源 (Barcode Source):", self.combo_barcode_source)
-        form_layout.addRow("数量来源 (Quantity Source):", self.combo_qty_source)
+        form_layout.addRow(BodyLabel("条码数据来源 (Barcode Source):"), self.combo_barcode_source)
+        form_layout.addRow(BodyLabel("数量来源 (Quantity Source):"), self.combo_qty_source)
         
         # Multiplier Setting
-        self.spin_multiplier = QSpinBox()
+        self.spin_multiplier = SpinBox()
         self.spin_multiplier.setRange(1, 100)
         self.spin_multiplier.setValue(self.label_multiplier)
-        form_layout.addRow("打印数量倍数 (Label Multiplier):", self.spin_multiplier)
+        form_layout.addRow(BodyLabel("打印数量倍数 (Label Multiplier):"), self.spin_multiplier)
         
         layout.addLayout(form_layout)
         
         # Save Button
         layout.addSpacing(20)
-        btn_save = QPushButton("保存设置")
-        btn_save.setObjectName("ActionButton")
+        btn_save = PrimaryPushButton("保存设置", self.card_general)
         btn_save.setFixedWidth(120)
+        btn_save.setIcon(FluentIcon.SAVE)
         btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save.clicked.connect(self.save_settings)
         
@@ -970,42 +1235,58 @@ class MainWindow(QMainWindow):
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         
-        title = QLabel("云端同步设置 (Supabase Cloud)")
-        title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        title = SubtitleLabel("云端同步设置 (Supabase Cloud)")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: white;")
         layout.addWidget(title)
         
-        desc = QLabel("启用云端同步后，历史记录将保存到在线数据库，实现多台电脑数据共享。")
-        desc.setStyleSheet("color: #666;")
+        desc = BodyLabel("启用云端同步后，历史记录将保存到在线数据库，实现多台电脑数据共享。")
+        desc.setStyleSheet("color: white;") 
         desc.setWordWrap(True)
         layout.addWidget(desc)
         
         form = QFormLayout()
         
-        self.chk_cloud_enable = QCheckBox("启用云端同步 (Enable Cloud Sync)")
+        self.chk_cloud_enable = CheckBox("启用云端同步 (Enable Cloud Sync)")
         self.chk_cloud_enable.setChecked(self.settings.value("cloud_enabled", "false") == "true")
         
-        self.input_cloud_url = QLineEdit()
+        self.input_cloud_url = LineEdit(self.card_cloud)
         self.input_cloud_url.setPlaceholderText("https://xyz.supabase.co")
         self.input_cloud_url.setText(self.settings.value("cloud_url", ""))
+        self.input_cloud_url.setClearButtonEnabled(True)
         
-        self.input_cloud_key = QLineEdit()
-        self.input_cloud_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.input_cloud_key = LineEdit(self.card_cloud)
+        self.input_cloud_key.setEchoMode(LineEdit.EchoMode.Password)
         self.input_cloud_key.setPlaceholderText("eyJhbg...")
         self.input_cloud_key.setText(self.settings.value("cloud_key", ""))
+        self.input_cloud_key.setClearButtonEnabled(True)
         
         form.addRow(self.chk_cloud_enable)
-        form.addRow("Project URL:", self.input_cloud_url)
-        form.addRow("Anon Key:", self.input_cloud_key)
+        form.addRow(BodyLabel("Project URL:"), self.input_cloud_url)
+        form.addRow(BodyLabel("Anon Key:"), self.input_cloud_key)
         
         layout.addLayout(form)
         
-        btn_save_cloud = QPushButton("保存连接设置")
-        btn_save_cloud.setObjectName("ActionButton")
+        btn_save_cloud = PrimaryPushButton("保存连接设置", self.card_cloud)
         btn_save_cloud.setFixedWidth(150)
+        btn_save_cloud.setIcon(FluentIcon.SAVE)
         btn_save_cloud.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save_cloud.clicked.connect(self.save_cloud_settings)
         
         layout.addWidget(btn_save_cloud)
+        
+        # Sync Button
+        self.btn_sync = PushButton("同步记录", self.card_cloud)
+        self.btn_sync.setFixedWidth(150)
+        self.btn_sync.setIcon(FluentIcon.SYNC)
+        self.btn_sync.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sync.clicked.connect(self.trigger_sync)
+        layout.addWidget(self.btn_sync)
+        
+        # Sync status label
+        self.lbl_sync_status = BodyLabel("")
+        self.lbl_sync_status.setStyleSheet("color: #888;")
+        layout.addWidget(self.lbl_sync_status)
+        
         layout.addStretch()
 
     def save_cloud_settings(self):
@@ -1024,6 +1305,37 @@ class MainWindow(QMainWindow):
              QMessageBox.warning(self, "提示", "请填写完整的 URL 和 Key")
         else:
              QMessageBox.information(self, "保存成功", "云端设置已保存！\n(如果启用，请尝试刷新历史记录查看连接状态)")
+
+    def trigger_sync(self):
+        reply = QMessageBox.question(self, "确认同步", "确认同步本地与云端数据吗？\n• 本地新记录将上传到云端\n• 云端新记录将下载到本地\n• 删除的记录会同步删除", 
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            # Create progress dialog
+            from PyQt6.QtWidgets import QProgressDialog
+            progress = QProgressDialog("正在同步...", None, 0, 0, self)
+            progress.setWindowTitle("同步中")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setCancelButton(None)  # No cancel button
+            progress.setMinimumWidth(300)
+            progress.show()
+            
+            # Progress callback
+            def update_progress(status_text):
+                progress.setLabelText(status_text)
+                QApplication.processEvents()  # Force UI update
+            
+            try:
+                msg = self.db.perform_sync(progress_callback=update_progress)
+            finally:
+                progress.close()
+            
+            QMessageBox.information(self, "同步结果", msg)
+            # Refresh history after sync to show downloaded records
+            self.refresh_history_batches()
+            # Update status label
+            if hasattr(self, 'lbl_sync_status'):
+                self.lbl_sync_status.setText(f"上次同步: {datetime.now().strftime('%H:%M:%S')}  {msg}")
 
     def refresh_settings_table(self):
         self.settings_table.setRowCount(0)
@@ -1127,9 +1439,9 @@ class MainWindow(QMainWindow):
         
         # Header with Search
         header_layout = QHBoxLayout()
-        header_layout.addWidget(QLabel("导入记录 (Batches)"))
+        header_layout.addWidget(SubtitleLabel("导入记录 (Batches)", self.page_history))
         
-        self.history_search_input = QLineEdit()
+        self.history_search_input = LineEdit(self.page_history)
         self.history_search_input.setPlaceholderText("Search history...")
         self.history_search_input.setClearButtonEnabled(True)
         self.history_search_input.textChanged.connect(self.filter_history_batches)
@@ -1137,18 +1449,23 @@ class MainWindow(QMainWindow):
         
         left_layout.addLayout(header_layout)
 
-        self.history_batch_list = QTableWidget()
-        self.history_batch_list.setColumnCount(4)
-        self.history_batch_list.setHorizontalHeaderLabels(["ID", "时间", "文件名", "操作"])
+        self.history_batch_list = TableWidget()
+        self.history_batch_list.setColumnCount(3)
+        self.history_batch_list.setHorizontalHeaderLabels(["时间", "文件名", "操作"])
         self.history_batch_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+
+        self.history_batch_list.setBorderVisible(True)
+        self.history_batch_list.setBorderRadius(8)
         self.history_batch_list.itemClicked.connect(self.load_history_details)
         left_layout.addWidget(self.history_batch_list)
         
         # Right: Detail View
         right_panel = QFrame()
         right_layout = QVBoxLayout(right_panel)
-        right_layout.addWidget(QLabel("详细内容 (Details)"))
-        self.history_detail_table = QTableWidget()
+        right_layout.addWidget(SubtitleLabel("详细内容 (Details)", right_panel))
+        self.history_detail_table = TableWidget()
+        self.history_detail_table.setBorderVisible(True)
+        self.history_detail_table.setBorderRadius(8)
         # Columns setup in load_history_details
         
         # Custom Filter Header for History Table
@@ -1168,32 +1485,64 @@ class MainWindow(QMainWindow):
     def refresh_history_batches(self):
         batches = self.db.get_batches()
         self.history_batch_list.setRowCount(0)
-        self.history_batch_list.setColumnWidth(0, 40)
-        self.history_batch_list.setColumnWidth(1, 140)
-        self.history_batch_list.setColumnWidth(3, 60)
+        self.history_batch_list.setColumnWidth(0, 140)
+        self.history_batch_list.setColumnWidth(2, 60)
         
         for b in batches:
             row = self.history_batch_list.rowCount()
             self.history_batch_list.insertRow(row)
             batch_id = b[0]
-            # ID
-            item_id = QTableWidgetItem(str(batch_id))
-            item_id.setToolTip(str(batch_id)) # Add tooltip
-            self.history_batch_list.setItem(row, 0, item_id)
             # Time
             item_time = QTableWidgetItem(str(b[2]))
-            item_time.setToolTip(str(b[2])) # Add tooltip
-            self.history_batch_list.setItem(row, 1, item_time)
+            item_time.setToolTip(str(b[2]))
+            item_time.setData(Qt.ItemDataRole.UserRole, batch_id)  # Store batch_id for later use
+            self.history_batch_list.setItem(row, 0, item_time)
             # Filename
             item_filename = QTableWidgetItem(str(b[1]))
-            item_filename.setToolTip(str(b[1])) # Add tooltip
-            self.history_batch_list.setItem(row, 2, item_filename)
+            item_filename.setToolTip(str(b[1]))
+            self.history_batch_list.setItem(row, 1, item_filename)
             
             # Delete Button
-            btn_del = QPushButton("×")
+            btn_del = PushButton()
+            btn_del.setIcon(FluentIcon.CLOSE)
             btn_del.setFixedWidth(30)
             btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn_del.setStyleSheet("background-color: #d9534f; color: white; border-radius: 4px; font-weight: bold; padding: 0px;")
+            # Make the X red and button transparent
+            btn_del.setStyleSheet("""
+                QPushButton { border: none; background-color: transparent; }
+                QPushButton:hover { background-color: #e9e9e9; border-radius: 4px; }
+                QPushButton:pressed { background-color: #d0d0d0; }
+            """)
+            # Force icon color if possible, or reliable way via qfluentwidgets theme? 
+            # Actually, fluent icon colors adapt. To force red, we might need a custom icon or different widget.
+            # But let's try a simpler approach if icon color is tricky: 
+            # Use a style to color the foreground or use a ToolButton? 
+            # Let's use a specialized red theme or plain styling.
+            # Simpler: just set the specific property if supported or accept standard look but red hover?
+            # User wants "Red X". 
+            # Let's try replacing PushButton with a transparent one and styling.
+            # qfluentwidgets has 'TransparentToolButton'.
+            
+            # Let's stick to PushButton but styled.
+            
+            # Note: FluentIcon.CLOSE is an Enum. 
+            # To get a Red X, we might need to paint it or use a different icon source? 
+            # Or assume the user is okay with the button being red? "Button add a red x".
+            # Maybe the button itself should be red? "Delete" usually implies red button.
+            # But "add a red x" suggests the icon. 
+            # Let's try to set a red SVG or similar if we can.
+            # Since we can't easily change the FluentIcon color instance here without digging into the library,
+            # We will use the library's `setCustomBackgroundColor` if available or just style the border/text.
+            # Actually, let's just use a native font 'X' and color it red if FluentIcon is stubborn.
+            # OR create a custom widget.
+            
+            # FASTEST/BEST PATH: Use a red close icon.
+            # If QIcon, we can't easily colorize.
+            # Let's just style the button to look like a red action.
+            btn_del.setStyleSheet("QPushButton { color: #f00; border: none; background: transparent; font-weight: bold; font-family: Segoe UI; font-size: 16px; }")
+            btn_del.setText("✕") # Use text X which we can color easily
+            btn_del.setIcon(QIcon()) # Remove icon to use text
+            
             btn_del.clicked.connect(lambda _, bid=batch_id: self.delete_batch_action(bid))
             
             container = QWidget()
@@ -1201,7 +1550,7 @@ class MainWindow(QMainWindow):
             layout.setContentsMargins(0, 0, 0, 0)
             layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(btn_del)
-            self.history_batch_list.setCellWidget(row, 3, container)
+            self.history_batch_list.setCellWidget(row, 2, container)
 
     def filter_history_batches(self, text):
         text = text.lower().strip()
@@ -1234,7 +1583,8 @@ class MainWindow(QMainWindow):
         row = item.row()
         batch_id_item = self.history_batch_list.item(row, 0)
         if not batch_id_item: return
-        batch_id = int(batch_id_item.text())
+        batch_id = batch_id_item.data(Qt.ItemDataRole.UserRole)  # Get batch_id from UserRole
+        if not batch_id: return
         
         items = self.db.get_batch_items(batch_id)
         self.history_detail_table.setRowCount(0)
@@ -1279,7 +1629,7 @@ class MainWindow(QMainWindow):
                 
             # Preview Column
             preview_col_idx = col_idx
-            preview_item = QTableWidgetItem("Waiting...")
+            preview_item = QTableWidgetItem("")
             # Store Data for Print/Preview
             preview_item.setData(Qt.ItemDataRole.UserRole, data)
             preview_item.setData(Qt.ItemDataRole.UserRole + 1, db_item_id)
@@ -1299,9 +1649,9 @@ class MainWindow(QMainWindow):
             btn_layout.setContentsMargins(5, 5, 5, 5)
             btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             
-            btn_print = QPushButton("🖨️ Print")
+            btn_print = PrimaryPushButton("🖨️ Print")
             btn_print.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn_print.setStyleSheet("background-color: #007acc; color: white; border-radius: 4px; padding: 4px 8px;")
+            # btn_print.setStyleSheet(...)
             # Connect to generic print function
             # Pass (table_widget, row_index)
             btn_print.clicked.connect(lambda _, t=self.history_detail_table, r=row_idx: self.print_generic_row(t, r))
@@ -1392,7 +1742,7 @@ class MainWindow(QMainWindow):
         
         # 4. Show Dialog
         dialog = QDialog(self)
-        dialog.setWindowTitle("预览 (Preview Detail)")
+        dialog.setWindowTitle(f"详情预览: {barcode_content}")
         vbox = QVBoxLayout(dialog)
         
         lbl = QLabel()
@@ -1401,6 +1751,19 @@ class MainWindow(QMainWindow):
         lbl.setStyleSheet("border: 1px solid #ccc;")
         
         vbox.addWidget(lbl)
+        
+        # Print Button
+        btn_print = PrimaryPushButton("🖨️ Print", dialog)
+        btn_print.setIcon(FluentIcon.PRINT)
+        btn_print.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+        def do_print_action():
+            self.print_generic_row(self.history_detail_table, row)
+            dialog.accept()
+        
+        btn_print.clicked.connect(do_print_action)
+        vbox.addWidget(btn_print)
+        
         dialog.exec()
             
     def update_history_preview(self, batch):
@@ -1489,7 +1852,7 @@ class MainWindow(QMainWindow):
                 
                 # Preview Column (Count - 3)
                 preview_col_idx = col_idx 
-                preview_item = QTableWidgetItem("Waiting...")
+                preview_item = QTableWidgetItem("")
                 # Store DB Item ID in UserRole of Preview Item for easy access
                 preview_item.setData(Qt.ItemDataRole.UserRole, item_snapshot)
                 preview_item.setData(Qt.ItemDataRole.UserRole + 1, db_item_id) 
@@ -1509,9 +1872,9 @@ class MainWindow(QMainWindow):
                 btn_layout.setContentsMargins(5, 5, 5, 5)
                 btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 
-                btn_print_row = QPushButton("🖨️ Print")
+                btn_print_row = PrimaryPushButton("🖨️ Print")
                 btn_print_row.setCursor(Qt.CursorShape.PointingHandCursor)
-                btn_print_row.setStyleSheet("background-color: #007acc; color: white; border-radius: 4px; padding: 4px 8px;")
+                # btn_print_row.setStyleSheet(...)
                 btn_print_row.clicked.connect(lambda _, r=row_idx: self.print_row_action(r))
                 
                 btn_layout.addWidget(btn_print_row)
@@ -1544,6 +1907,34 @@ class MainWindow(QMainWindow):
                     total_qty = 0
                     
             self.lbl_status.setText(f"已加载 {len(self.df)} 行数据，总计数量 {total_qty}")
+            
+            # Auto-sync to cloud if enabled
+            if self.db.use_cloud and self.db.cloud_db and self.db.cloud_db.enabled:
+                try:
+                    # Get the batch we just added to fetch exact timestamp
+                    imported_at_str = ""
+                    try:
+                        cursor = self.db.local_db.conn.cursor()
+                        cursor.execute("SELECT imported_at FROM batches WHERE id = ?", (batch_id,))
+                        row = cursor.fetchone()
+                        if row: imported_at_str = row[0]
+                    except:
+                        pass
+                    
+                    if not imported_at_str:
+                         imported_at_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    batch_row = (batch_id, os.path.basename(file_path), imported_at_str)
+                    items = self.db.get_batch_items(batch_id)
+                    
+                    # Upload to cloud
+                    if self.db.cloud_db.upload_local_batch(batch_row, items):
+                        self.lbl_status.setText(f"已加载 {len(self.df)} 行数据，总计数量 {total_qty} ✓ 已同步云端")
+                    else:
+                        self.lbl_status.setText(f"已加载 {len(self.df)} 行数据，总计数量 {total_qty} ⚠ 云端同步失败")
+                except Exception as e:
+                    print(f"[Auto Sync] Error: {e}")
+                    self.lbl_status.setText(f"已加载 {len(self.df)} 行数据，总计数量 {total_qty} ⚠ 云端同步异常")
 
         except Exception as e:
             QMessageBox.critical(self, "导入失败", f"无法读取文件: {str(e)}")
@@ -1693,8 +2084,9 @@ class MainWindow(QMainWindow):
         vbox.addWidget(lbl)
         
         # Add Print Button
-        btn_print = QPushButton("🖨️ Print")
-        btn_print.setStyleSheet("font-size: 18px; padding: 10px; font-weight: bold; background-color: #007acc; color: white; border-radius: 4px;")
+        btn_print = PrimaryPushButton("🖨️ Print", dialog)
+        btn_print.setIcon(FluentIcon.PRINT)
+        # btn_print.setStyleSheet(...)
         btn_print.setCursor(Qt.CursorShape.PointingHandCursor)
         vbox.addWidget(btn_print)
         
@@ -2647,7 +3039,14 @@ class MainWindow(QMainWindow):
             painter.end()
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    try:
+        # app is initialized at module level to support qfluentwidgets
+        window = MainWindow()
+        window.show()
+        sys.exit(app.exec())
+    except Exception as e:
+        print(f"CRITICAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
