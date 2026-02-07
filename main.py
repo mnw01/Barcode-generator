@@ -903,9 +903,16 @@ class MainWindow(FluentWindow):
 
         self.setWindowTitle("批量条码生成工具")
         
-        # Set Window Icon
-        if os.path.exists("app.ico"):
-            self.setWindowIcon(QIcon("app.ico"))
+        # Set Window Icon (compatible with PyInstaller)
+        def resource_path(relative_path):
+            """Get absolute path to resource, works for dev and PyInstaller"""
+            if hasattr(sys, '_MEIPASS'):
+                return os.path.join(sys._MEIPASS, relative_path)
+            return os.path.join(os.path.abspath("."), relative_path)
+        
+        icon_path = resource_path("app.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
             
         self.resize(1100, 750) 
         
@@ -1139,13 +1146,17 @@ class MainWindow(FluentWindow):
         # Search Box
         self.search_input = LineEdit(self.page_home)
         self.search_input.setPlaceholderText("搜索 (Search)...")
-        self.search_input.setFixedWidth(200)
+        self.search_input.setFixedWidth(170)
         self.search_input.setClearButtonEnabled(True)
         self.search_input.textChanged.connect(self.apply_filters)
         top_bar.addWidget(self.search_input)
         
+        top_bar.addSpacing(30)  # Add spacing between search and buttons
+        
         top_bar.addWidget(self.btn_import)
+        top_bar.addSpacing(8)  # Add spacing between buttons
         top_bar.addWidget(self.btn_clear)
+        top_bar.addSpacing(8)
         top_bar.addWidget(self.btn_generate)
 
         layout.addLayout(top_bar)
