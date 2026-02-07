@@ -4,6 +4,14 @@ import os
 # Force qfluentwidgets to use PyQt6 (resolves conflict with installed PyQt5)
 os.environ["QT_API"] = "pyqt6"
 
+# Fix Windows taskbar icon - set AppUserModelID
+try:
+    import ctypes
+    myappid = 'mycompany.barcodegenerator.pro.1.0'  # Unique app identifier
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+except:
+    pass
+
 import io
 import re
 import sqlite3
@@ -25,6 +33,107 @@ if QApplication.instance() is None:
 else:
     app = QApplication.instance()
 
+# --- Splash Screen Class ---
+from PyQt6.QtCore import Qt as QtCore_Qt, QTimer as QtCore_QTimer
+from PyQt6.QtGui import QPainter as QtGui_QPainter, QColor as QtGui_QColor, QFont as QtGui_QFont, QLinearGradient as QtGui_QLinearGradient
+
+class SplashScreen(QWidget):
+    """美观的启动加载进度界面"""
+    
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(QtCore_Qt.WindowType.FramelessWindowHint | QtCore_Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(QtCore_Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        self.setFixedSize(420, 280)
+        
+        # Center on screen
+        screen = app.primaryScreen().geometry()
+        x = (screen.width() - self.width()) // 2
+        y = (screen.height() - self.height()) // 2
+        self.move(x, y)
+        
+        self.progress = 0
+        self.status_text = "正在初始化..."
+        
+    def setProgress(self, value: int, status: str = None):
+        """设置进度 (0-100) 和状态文字"""
+        self.progress = min(100, max(0, value))
+        if status:
+            self.status_text = status
+        self.update()
+        app.processEvents()
+        
+    def paintEvent(self, event):
+        painter = QtGui_QPainter(self)
+        painter.setRenderHint(QtGui_QPainter.RenderHint.Antialiasing)
+        
+        # Draw rounded background
+        bg_color = QtGui_QColor(30, 35, 45, 240)
+        painter.setBrush(bg_color)
+        painter.setPen(QtCore_Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(0, 0, self.width(), self.height(), 20, 20)
+        
+        # Draw border glow
+        border_color = QtGui_QColor(80, 140, 220, 100)
+        painter.setPen(border_color)
+        painter.setBrush(QtCore_Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(2, 2, self.width()-4, self.height()-4, 18, 18)
+        
+        # Draw title
+        title_font = QtGui_QFont("Microsoft YaHei", 22, QtGui_QFont.Weight.Bold)
+        painter.setFont(title_font)
+        painter.setPen(QtGui_QColor(255, 255, 255))
+        painter.drawText(0, 50, self.width(), 40, QtCore_Qt.AlignmentFlag.AlignCenter, "批量条码生成工具")
+        
+        # Draw subtitle
+        sub_font = QtGui_QFont("Microsoft YaHei", 10)
+        painter.setFont(sub_font)
+        painter.setPen(QtGui_QColor(150, 160, 180))
+        painter.drawText(0, 85, self.width(), 25, QtCore_Qt.AlignmentFlag.AlignCenter, "Barcode Generator Pro")
+        
+        # Progress bar background
+        bar_x = 40
+        bar_y = 160
+        bar_width = self.width() - 80
+        bar_height = 8
+        
+        bg_bar_color = QtGui_QColor(60, 65, 75)
+        painter.setBrush(bg_bar_color)
+        painter.setPen(QtCore_Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(bar_x, bar_y, bar_width, bar_height, 4, 4)
+        
+        # Progress bar fill with gradient
+        if self.progress > 0:
+            fill_width = int(bar_width * self.progress / 100)
+            gradient = QtGui_QLinearGradient(bar_x, bar_y, bar_x + bar_width, bar_y)
+            gradient.setColorAt(0, QtGui_QColor(70, 130, 220))
+            gradient.setColorAt(0.5, QtGui_QColor(100, 180, 255))
+            gradient.setColorAt(1, QtGui_QColor(70, 200, 180))
+            painter.setBrush(gradient)
+            painter.drawRoundedRect(bar_x, bar_y, fill_width, bar_height, 4, 4)
+        
+        # Draw percentage
+        percent_font = QtGui_QFont("Microsoft YaHei", 11, QtGui_QFont.Weight.Bold)
+        painter.setFont(percent_font)
+        painter.setPen(QtGui_QColor(255, 255, 255))
+        painter.drawText(0, bar_y + 20, self.width(), 25, QtCore_Qt.AlignmentFlag.AlignCenter, f"{self.progress}%")
+        
+        # Draw status text
+        status_font = QtGui_QFont("Microsoft YaHei", 9)
+        painter.setFont(status_font)
+        painter.setPen(QtGui_QColor(130, 140, 160))
+        painter.drawText(0, bar_y + 50, self.width(), 20, QtCore_Qt.AlignmentFlag.AlignCenter, self.status_text)
+        
+        painter.end()
+
+# Create and show splash screen immediately
+_splash = SplashScreen()
+_splash.show()
+_splash.setProgress(5, "正在加载界面组件...")
+app.processEvents()
+
+
 # Suppress qfluentwidgets promotional message
 _original_stdout = sys.stdout
 sys.stdout = io.StringIO()
@@ -36,9 +145,16 @@ try:
                                 Pivot, SegmentedWidget, ScrollArea, SimpleCardWidget, CheckBox)
 finally:
     sys.stdout = _original_stdout
+
+_splash.setProgress(20, "正在加载Qt核心模块...")
+app.processEvents()
+
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QRect, QPointF, QPoint, QCoreApplication, QTimer
 from PyQt6.QtGui import QIcon, QAction, QPainter, QColor, QPixmap, QImage, QFontMetrics, QPageLayout, QPageSize, QFont
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog, QPrinterInfo
+
+_splash.setProgress(35, "正在加载PDF生成模块...")
+app.processEvents()
 
 # ReportLab & Barcode Imports
 from reportlab.pdfgen import canvas
@@ -47,6 +163,10 @@ from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+
+_splash.setProgress(50, "正在加载条码模块...")
+app.processEvents()
+
 import barcode
 from barcode.writer import ImageWriter
 # Removed unused import requests
@@ -69,6 +189,9 @@ except Exception as e:
     print(f"Font loading warning: {e}")
 
 CHINESE_FONT_PATH = "C:/Windows/Fonts/msyh.ttc"  # Microsoft YaHei
+
+_splash.setProgress(65, "正在加载界面类...")
+app.processEvents()
 
 class FilterHeader(QHeaderView):
     filterClicked = pyqtSignal(int, QPoint)
@@ -1752,19 +1875,27 @@ class MainWindow(FluentWindow):
         if not file_path:
             return
 
-        # Show loading dialog
+        # Show loading dialog - initial phase
         from PyQt6.QtWidgets import QProgressDialog
-        loading = QProgressDialog("正在导入文件...", None, 0, 0, self)
+        loading = QProgressDialog("正在读取文件...", None, 0, 100, self)
         loading.setWindowTitle("请稍候")
         loading.setWindowModality(Qt.WindowModality.WindowModal)
         loading.setMinimumDuration(0)
         loading.setCancelButton(None)
         loading.setMinimumWidth(280)
+        loading.setValue(5)
         loading.show()
         QApplication.processEvents()
 
         try:
+            loading.setLabelText("正在解析 Excel 数据...")
+            loading.setValue(10)
+            QApplication.processEvents()
+            
             self.df = pd.read_excel(file_path)
+            
+            loading.setValue(20)
+            QApplication.processEvents()
             
             # Validation
             # Get all required headers from mapping
@@ -1778,6 +1909,10 @@ class MainWindow(FluentWindow):
             
             # Prepare for UI
             df = self.df.fillna("")
+            
+            loading.setLabelText("正在保存到数据库...")
+            loading.setValue(25)
+            QApplication.processEvents()
             
             # Save Batch to DB
             batch_id = self.db.add_batch(os.path.basename(file_path))
@@ -1795,6 +1930,11 @@ class MainWindow(FluentWindow):
             
             # Barcode Header
             barcode_header = self.barcode_source
+            
+            total_rows = len(df)
+            loading.setLabelText(f"正在导入数据 (0/{total_rows})...")
+            loading.setValue(30)
+            QApplication.processEvents()
             
             for index, row in df.iterrows():
                 row_idx = self.table.rowCount()
@@ -1857,8 +1997,18 @@ class MainWindow(FluentWindow):
                 btn_layout.addWidget(btn_print_row)
                 self.table.setCellWidget(row_idx, action_col_idx, container)
                 
+                # Update progress every 5 rows or on last row
+                if row_idx % 5 == 0 or row_idx == total_rows - 1:
+                    progress = 30 + int((row_idx + 1) / total_rows * 50)  # 30-80%
+                    loading.setLabelText(f"正在导入数据 ({row_idx + 1}/{total_rows})...")
+                    loading.setValue(progress)
+                    QApplication.processEvents()
                     
             # Start Preview Generation
+            loading.setLabelText("正在生成预览...")
+            loading.setValue(85)
+            QApplication.processEvents()
+            
             preview_tasks = []
             for r in range(self.table.rowCount()):
                  # Get item data from preview item
@@ -1887,6 +2037,10 @@ class MainWindow(FluentWindow):
             
             # Auto-sync to cloud if enabled
             if self.db.use_cloud and self.db.cloud_db and self.db.cloud_db.enabled:
+                loading.setLabelText("正在同步到云端...")
+                loading.setValue(90)
+                QApplication.processEvents()
+                
                 try:
                     # Get the batch we just added to fetch exact timestamp
                     imported_at_str = ""
@@ -1912,6 +2066,9 @@ class MainWindow(FluentWindow):
                 except Exception as e:
                     print(f"[Auto Sync] Error: {e}")
                     self.lbl_status.setText(f"已加载 {len(self.df)} 行数据，总计数量 {total_qty} ⚠ 云端同步异常")
+            
+            loading.setValue(100)
+            QApplication.processEvents()
 
         except Exception as e:
             QMessageBox.critical(self, "导入失败", f"无法读取文件: {str(e)}")
@@ -3019,11 +3176,34 @@ class MainWindow(FluentWindow):
 
 if __name__ == "__main__":
     try:
+        # Update splash progress before creating main window
+        _splash.setProgress(80, "正在初始化主窗口...")
+        app.processEvents()
+        
         # app is initialized at module level to support qfluentwidgets
         window = MainWindow()
+        
+        _splash.setProgress(95, "正在准备界面...")
+        app.processEvents()
+        
+        # Brief delay to show final progress
+        import time
+        time.sleep(0.2)
+        
+        _splash.setProgress(100, "加载完成!")
+        app.processEvents()
+        time.sleep(0.3)
+        
+        # Close splash and show main window
+        _splash.close()
+        
+        # Ensure window displays at proper size (not minimized)
+        window.setMinimumSize(800, 600)
+        window.resize(1100, 750)
         window.show()
         sys.exit(app.exec())
     except Exception as e:
+        _splash.close()
         print(f"CRITICAL ERROR: {e}")
         import traceback
         traceback.print_exc()
